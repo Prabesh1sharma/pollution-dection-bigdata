@@ -92,6 +92,7 @@ services:
     env_file: ./hadoop/hadoop.env
     environment:
       ENSURE_NAMENODE_DIR: /tmp/hdfs/name
+      HADOOP_HEAPSIZE: 512
     volumes:
       - ./data:/local-data:ro
       - ./hadoop/entrypoint.sh:/entrypoint.sh:ro
@@ -102,6 +103,8 @@ services:
     entrypoint: ["/bin/bash", "/entrypoint.sh"]
     command: ["hdfs", "datanode"]
     env_file: ./hadoop/hadoop.env
+    environment:
+      HADOOP_HEAPSIZE: 512
     volumes:
       - ./hadoop/entrypoint.sh:/entrypoint.sh:ro
     depends_on:
@@ -125,8 +128,8 @@ services:
     depends_on:
       - spark-master
     environment:
-      SPARK_WORKER_CORES: ${SPARK_WORKER_CORES:-4}
-      SPARK_WORKER_MEMORY: ${SPARK_WORKER_MEMORY:-5g}
+      SPARK_WORKER_CORES: ${SPARK_WORKER_CORES:-2}
+      SPARK_WORKER_MEMORY: ${SPARK_WORKER_MEMORY:-1g}
     ports:
       - "8081:8081"
 
@@ -138,10 +141,25 @@ services:
     hostname: spark-train
     profiles: ["train"]
     depends_on:
-      - namenode
-      - datanode
-      - spark-master
-      - spark-worker
+      namenode:
+        condition: service_started
+      datanode:
+        condition: service_started
+      spark-master:
+        condition: service_started
+      spark-worker:
+        condition: service_started
+      cassandra:
+        condition: service_started
+      cassandra-init:
+        condition: service_completed_successfully
+    environment:
+      NUM_TREES: ${NUM_TREES:-20}
+      MAX_DEPTH: ${MAX_DEPTH:-8}
+      TRAIN_SAMPLE_FRACTION: ${TRAIN_SAMPLE_FRACTION:-0.2}
+      TRAIN_PARTITIONS: ${TRAIN_PARTITIONS:-2}
+      TRAIN_CORES: ${TRAIN_CORES:-1}
+      TRAIN_EXECUTOR_MEMORY: ${TRAIN_EXECUTOR_MEMORY:-768m}
     entrypoint: ["/bin/bash", "-c"]
     command:
       - |
@@ -160,8 +178,9 @@ services:
           --packages=com.datastax.spark:spark-cassandra-connector_2.12:3.5.1 \
           --conf=spark.jars.ivy=/tmp/.ivy2 \
           --conf=spark.cores.max=${TRAIN_CORES:-1} \
-          --conf=spark.executor.memory=${TRAIN_EXECUTOR_MEMORY:-800m} \
+          --conf=spark.executor.memory=${TRAIN_EXECUTOR_MEMORY:-768m} \
           --conf=spark.driver.memory=512m \
+          --conf=spark.sql.shuffle.partitions=4 \
           --conf=spark.driver.host=spark-train \
           --conf=spark.cassandra.connection.host=cassandra \
           /opt/jobs/train_model.py
@@ -172,12 +191,13 @@ services:
     <<: *spark-common
     container_name: spark-streaming
     hostname: spark-streaming
+    profiles: ["streaming"]
     restart: unless-stopped
     depends_on:
       kafka-init:
         condition: service_completed_successfully
       namenode:
-        condition: service_healthy
+        condition: service_started
       spark-master:
         condition: service_started
       spark-worker:
@@ -189,9 +209,9 @@ services:
       - --master=spark://spark-master:7077
       - --packages=org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.3,com.datastax.spark:spark-cassandra-connector_2.12:3.5.1
       - --conf=spark.jars.ivy=/tmp/.ivy2
-      - --conf=spark.cores.max=${STREAM_CORES:-2}
-      - --conf=spark.executor.memory=1g
-      - --conf=spark.driver.memory=1g
+      - --conf=spark.cores.max=${STREAM_CORES:-1}
+      - --conf=spark.executor.memory=768m
+      - --conf=spark.driver.memory=768m
       - --conf=spark.driver.host=spark-streaming
       - --conf=spark.cassandra.connection.host=cassandra
       - /opt/jobs/stream_predict.py
@@ -200,11 +220,12 @@ services:
   cassandra:
     image: cassandra:4.1
     container_name: cassandra
+    restart: unless-stopped
     ports:
       - "9042:9042"
     environment:
-      MAX_HEAP_SIZE: 1G
-      HEAP_NEWSIZE: 256M
+      MAX_HEAP_SIZE: 512M
+      HEAP_NEWSIZE: 128M
       CASSANDRA_CLUSTER_NAME: airquality
     volumes:
       - cassandra-data:/var/lib/cassandra

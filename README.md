@@ -39,17 +39,27 @@ cp .env.example .env            # add KAGGLE_USERNAME / KAGGLE_KEY (kaggle.com �
 # 1. Dataset (downloaded inside a throw-away container) – ~2.5M rows
 ./scripts/download_kaggle.sh
 
-# 2. Start the stack (first build downloads images + Spark connector jars; takes a while)
+# 2. Start the stack (first build downloads images + Spark connector jars; takes a while).
+#    Streaming is held back until training finishes to save memory.
 docker compose up -d --build
 
 # 3. Put the dataset into HDFS, then train
 ./scripts/load_hdfs.sh
 docker compose --profile train run --rm spark-train
+
+# 4. Start real-time inference after the models have been saved
+docker compose --profile streaming up -d spark-streaming
 ```
 
-The streaming job (`spark-streaming`) is already running after step 2 and **waits until the models exist**;
-once training finishes it starts scoring everything the producer has sent (7 days of hourly back-fill, then new
-observations every 5 minutes). Open **http://localhost:3000** after a minute or two.
+`./scripts/load_hdfs.sh` uploads the header and about 10% of CSV rows to HDFS as a gzip stream by default. Set
+`DATA_ROW_STRIDE=1` in `.env` to upload every row, or adjust the stride (for example, `20` for about 5%). The local
+CSV remains unchanged. The script also exits HDFS safe mode if needed before re-uploading, for this single-node
+development cluster.
+
+The training job samples 20% of the training split and uses 20 trees of depth 8 by default to fit an 8 GB
+development machine. Override `NUM_TREES`, `MAX_DEPTH`, or `TRAIN_SAMPLE_FRACTION` in `.env` for a larger model.
+Once started, `spark-streaming` scores observations from Kafka (7 days of hourly back-fill, then new observations
+every 5 minutes). Open **http://localhost:3000** after a minute or two.
 
 | URL | What |
 |---|---|
@@ -68,7 +78,8 @@ docker compose restart spark-streaming                 # reload models after re-
 docker compose down            # stop (Cassandra/Kafka data kept; HDFS contents are lost – re-run steps 3)
 ```
 
-Small machine? Lower `SPARK_WORKER_MEMORY`, `TRAIN_*`/`STREAM_CORES` and `NUM_TREES` in `.env`/the job env.
+Small machine? Defaults are set conservatively (`SPARK_WORKER_MEMORY=1500m`, 2 worker cores, 20 trees). If a previous
+stack already has streaming running, stop it before training with `docker compose stop spark-streaming`.
 To try the pipeline without a Kaggle account: `python scripts/make_sample_data.py data/station_hour.csv 20000 10`
 (synthetic data, smoke-testing only).
 
