@@ -1,0 +1,272 @@
+name: air-quality-bigdata
+
+# ---------------------------------------------------------------------------
+# Real-time air pollution warning – Kathmandu / Pokhara / Biratnagar
+#
+#   Open-Meteo API -> producer -> Kafka -> Spark Structured Streaming (MLlib)
+#        -> Cassandra (predictions) + HDFS (raw lake) + Kafka (alerts)
+#        -> FastAPI -> Next.js dashboards
+#   Kaggle CSV -> HDFS -> Spark batch training (MLlib) -> models on HDFS
+# ---------------------------------------------------------------------------
+
+x-spark-image: &spark-image
+  build: ./spark
+  image: aq-spark:3.5.3
+
+x-spark-common: &spark-common
+  <<: *spark-image
+  user: root
+  volumes:
+    - ./spark/jobs:/opt/jobs:ro
+    - spark-ivy:/tmp/.ivy2
+
+services:
+  # ------------------------------------------------------------------ Kafka
+  kafka:
+    image: apache/kafka:3.8.0
+    container_name: kafka
+    ports:
+      - "29092:29092" # host access (localhost:29092)
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  kafka-init:
+    image: apache/kafka:3.8.0
+    container_name: kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        for t in air-quality-raw air-quality-predictions air-quality-alerts; do
+          /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 \
+            --create --if-not-exists --topic $$t --partitions 3 --replication-factor 1
+        done
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8089:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+
+  # ----------------------------------------------------------------- Hadoop
+  # NOTE: HDFS has no volume on purpose (re-format safety). Data survives
+  # `docker compose stop/start`, but not `docker compose down`.
+  namenode:
+    image: apache/hadoop:3.3.6
+    container_name: namenode
+    hostname: namenode
+    entrypoint: ["/bin/bash", "/entrypoint.sh"]
+    command: ["hdfs", "namenode"]
+    ports:
+      - "9870:9870" # NameNode web UI
+      - "8020:8020"
+    env_file: ./hadoop/hadoop.env
+    environment:
+      ENSURE_NAMENODE_DIR: /tmp/hdfs/name
+    volumes:
+      - ./data:/local-data:ro
+      - ./hadoop/entrypoint.sh:/entrypoint.sh:ro
+  datanode:
+    image: apache/hadoop:3.3.6
+    container_name: datanode
+    hostname: datanode
+    entrypoint: ["/bin/bash", "/entrypoint.sh"]
+    command: ["hdfs", "datanode"]
+    env_file: ./hadoop/hadoop.env
+    volumes:
+      - ./hadoop/entrypoint.sh:/entrypoint.sh:ro
+    depends_on:
+      - namenode
+
+  # ------------------------------------------------------------------ Spark
+  spark-master:
+    <<: *spark-image
+    container_name: spark-master
+    hostname: spark-master
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master", "--host", "spark-master"]
+    ports:
+      - "8080:8080" # Master UI
+      - "7077:7077"
+
+  spark-worker:
+    <<: *spark-image
+    container_name: spark-worker
+    hostname: spark-worker
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
+    depends_on:
+      - spark-master
+    environment:
+      SPARK_WORKER_CORES: ${SPARK_WORKER_CORES:-4}
+      SPARK_WORKER_MEMORY: ${SPARK_WORKER_MEMORY:-5g}
+    ports:
+      - "8081:8081"
+
+  # One-shot batch job: Kaggle CSV (HDFS) -> clean -> train MLlib models -> HDFS + Cassandra
+  # Run with:  docker compose --profile train run --rm spark-train
+  spark-train:
+    <<: *spark-common
+    container_name: spark-train
+    hostname: spark-train
+    profiles: ["train"]
+    depends_on:
+      - namenode
+      - datanode
+      - spark-master
+      - spark-worker
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        echo 'Waiting for HDFS NameNode RPC on namenode:8020...'
+        until bash -c '</dev/tcp/namenode/8020' 2>/dev/null; do
+          echo 'NameNode not ready yet, retrying in 10s...'; sleep 10
+        done
+        echo 'HDFS ready.'
+        echo 'Waiting for Cassandra...'
+        until bash -c '</dev/tcp/cassandra/9042' 2>/dev/null; do
+          echo 'Cassandra not ready yet, retrying in 10s...'; sleep 10
+        done
+        echo 'Cassandra ready.'
+        exec /opt/spark/bin/spark-submit \
+          --master=spark://spark-master:7077 \
+          --packages=com.datastax.spark:spark-cassandra-connector_2.12:3.5.1 \
+          --conf=spark.jars.ivy=/tmp/.ivy2 \
+          --conf=spark.cores.max=${TRAIN_CORES:-1} \
+          --conf=spark.executor.memory=${TRAIN_EXECUTOR_MEMORY:-800m} \
+          --conf=spark.driver.memory=512m \
+          --conf=spark.driver.host=spark-train \
+          --conf=spark.cassandra.connection.host=cassandra \
+          /opt/jobs/train_model.py
+
+  # Long-running: Kafka -> MLlib inference -> Cassandra / HDFS / Kafka alerts.
+  # Waits (retrying) until the trained models exist on HDFS.
+  spark-streaming:
+    <<: *spark-common
+    container_name: spark-streaming
+    hostname: spark-streaming
+    restart: unless-stopped
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      namenode:
+        condition: service_healthy
+      spark-master:
+        condition: service_started
+      spark-worker:
+        condition: service_started
+      cassandra-init:
+        condition: service_completed_successfully
+    command:
+      - /opt/spark/bin/spark-submit
+      - --master=spark://spark-master:7077
+      - --packages=org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.3,com.datastax.spark:spark-cassandra-connector_2.12:3.5.1
+      - --conf=spark.jars.ivy=/tmp/.ivy2
+      - --conf=spark.cores.max=${STREAM_CORES:-2}
+      - --conf=spark.executor.memory=1g
+      - --conf=spark.driver.memory=1g
+      - --conf=spark.driver.host=spark-streaming
+      - --conf=spark.cassandra.connection.host=cassandra
+      - /opt/jobs/stream_predict.py
+
+  # -------------------------------------------------------------- Cassandra
+  cassandra:
+    image: cassandra:4.1
+    container_name: cassandra
+    ports:
+      - "9042:9042"
+    environment:
+      MAX_HEAP_SIZE: 1G
+      HEAP_NEWSIZE: 256M
+      CASSANDRA_CLUSTER_NAME: airquality
+    volumes:
+      - cassandra-data:/var/lib/cassandra
+    healthcheck:
+      test: ["CMD-SHELL", "cqlsh -e 'DESCRIBE KEYSPACES' >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 15s
+      retries: 20
+      start_period: 60s
+
+  cassandra-init:
+    image: cassandra:4.1
+    container_name: cassandra-init
+    depends_on:
+      cassandra:
+        condition: service_healthy
+    restart: "no"
+    volumes:
+      - ./cassandra/schema.cql:/schema.cql:ro
+    entrypoint: ["cqlsh", "cassandra", "-f", "/schema.cql"]
+
+  # -------------------------------------------------------------- App tier
+  producer:
+    build: ./producer
+    container_name: aq-producer
+    restart: unless-stopped
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: air-quality-raw
+      POLL_INTERVAL_SECONDS: ${POLL_INTERVAL_SECONDS:-300}
+      BACKFILL_DAYS: ${BACKFILL_DAYS:-7}
+
+  api:
+    build: ./backend
+    container_name: aq-api
+    restart: unless-stopped
+    depends_on:
+      cassandra-init:
+        condition: service_completed_successfully
+    environment:
+      CASSANDRA_HOSTS: cassandra
+      CASSANDRA_KEYSPACE: airquality
+      CORS_ORIGINS: http://localhost:3000
+    ports:
+      - "8000:8000"
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        API_INTERNAL_URL: http://api:8000
+    container_name: aq-frontend
+    restart: unless-stopped
+    depends_on:
+      - api
+    ports:
+      - "3000:3000"
+
+volumes:
+  kafka-data:
+  cassandra-data:
+  spark-ivy:
