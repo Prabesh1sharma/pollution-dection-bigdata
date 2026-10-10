@@ -130,6 +130,8 @@ services:
     environment:
       SPARK_WORKER_CORES: ${SPARK_WORKER_CORES:-2}
       SPARK_WORKER_MEMORY: ${SPARK_WORKER_MEMORY:-1g}
+    volumes:
+      - ./models_local:/opt/models:ro
     ports:
       - "8081:8081"
 
@@ -204,6 +206,18 @@ services:
         condition: service_started
       cassandra-init:
         condition: service_completed_successfully
+    volumes:
+      - ./spark/jobs:/opt/jobs:ro
+      - spark-ivy:/tmp/.ivy2
+      - ./models_local:/opt/models:ro
+    environment:
+      # Hadoop runs emulated (x86 under QEMU) and is very slow, so keep the
+      # per-micro-batch lake + checkpoint off HDFS; only the models are read
+      # from HDFS once at startup.
+      MODEL_DIR: file:///opt/models
+      LAKE_DIR: file:///tmp/lake
+      CHECKPOINT_DIR: file:///tmp/checkpoints/stream_predict
+      TRIGGER_INTERVAL: ${TRIGGER_INTERVAL:-5 seconds}
     command:
       - /opt/spark/bin/spark-submit
       - --master=spark://spark-master:7077
