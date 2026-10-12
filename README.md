@@ -48,7 +48,7 @@ docker compose up -d --build
 docker compose --profile train run --rm spark-train
 
 # 4. Start real-time inference after the models have been saved
-docker compose --profile streaming up -d 
+docker compose --profile streaming up -d
 ```
 
 `./scripts/load_hdfs.sh` uploads the header and about 10% of CSV rows to HDFS as a gzip stream by default. Set

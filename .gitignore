@@ -9,3 +9,4 @@ node_modules/
 frontend/.next/
 frontend/node_modules/
 models_local/
+.DS_Store
